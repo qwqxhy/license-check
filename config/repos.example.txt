@@ -1,0 +1,4 @@
+# one repo URL per line (small repos for quick test)
+https://github.com/octocat/Hello-World.git
+https://github.com/octocat/Spoon-Knife.git
+https://github.com/githubtraining/hellogitworld.git

@@ -1,0 +1,115 @@
+[run]
+# Text file with repository list.
+# Each line supports:
+#   https://github.com/org/repo.git
+#   https://github.com/org/repo.git,main
+#   https://github.com/org/repo.git main
+repos_file = "config/repos.top1w.txt"
+
+batch_size = 100
+clone_workers = 8
+scan_workers = 16
+
+# Temporary working root for this batch pipeline.
+work_dir = "/tmp/license-batch-run"
+
+# Cleanup policy
+cleanup_clone_after_batch = true
+cleanup_local_result_after_upload = false
+
+# Runtime env for scancode compatibility
+lang = "C.UTF-8"
+lc_all = "C.UTF-8"
+scancode_cache = "/tmp/scancode-cache"
+scancode_temp = "/tmp/scancode-tmp"
+
+[github]
+default_ref = ""
+git_clone_depth = 1
+clone_timeout_sec = 1800
+
+[state]
+# Persist scan status. successful repos are skipped on restart.
+enabled = true
+db_path = "/root/lanyun-tmp/license-check-master/runtime/scan_state.db"
+
+[MIRROR]
+# Resolve GitHub ZIP paths via the OSSP API, then download from S3/MinIO.
+enabled = false
+endpoint = "public-s3.isrc.ac.cn"
+bucket = "yuantu"
+token_url = "https://sso.ossp.yuantu.ac.cn/auth/realms/ossp/protocol/openid-connect/token"
+repo_info_url = "https://ossp.yuantu.ac.cn/openapi/repository/info/filepath"
+client_id = ""
+client_secret = ""
+# Prefer env vars in production:
+#   MIRROR_CLIENT_ID
+#   MIRROR_CLIENT_SECRET
+#   MINIO_ACCESS_KEY
+#   MINIO_SECRET_KEY
+client_id_env = "MIRROR_CLIENT_ID"
+client_secret_env = "MIRROR_CLIENT_SECRET"
+access_key = ""
+secret_key = ""
+access_key_env = "MINIO_ACCESS_KEY"
+secret_key_env = "MINIO_SECRET_KEY"
+
+[REMOTE]
+# Sync results/logs to a remote server via rsync over SSH.
+enabled = false
+host = "10.211.152.12"
+port = 22
+user = "huayuan"
+base_dir = "/home/huayuan/workspace/storage"
+
+# Prefer SSH key auth:
+# ssh_key = "/home/huayuan/.ssh/id_rsa"
+ssh_key = ""
+
+# Optional password auth (requires sshpass installed):
+use_sshpass = false
+password_env = "REMOTE_PASSWORD"
+password = ""
+
+[GITHUB_FETCH]
+# Build repository list (1w by default) with resume support.
+output_file = "config/repos.top1w.txt"
+state_file = "config/github_fetch_state.json"
+target_count = 10000
+per_page = 100
+start_since = 0
+request_timeout_sec = 30
+sleep_sec = 0.2
+token_env = "GITHUB_TOKEN"
+# optional plain token (not recommended)
+token = ""
+
+[mongodb]
+host = "127.0.0.1"
+port = 27037
+user = "sca"
+password = "sca123"
+db = "sca"
+# optional full URL override
+url = ""
+
+[OSS]
+# Set to true in production.
+enabled = false
+
+# Aliyun OSS endpoint (scheme optional)
+endpoint = "oss-cn-hangzhou.aliyuncs.com"
+bucket = "your-bucket-name"
+prefix = "license-check-results"
+
+# Prefer environment variables in production:
+#   OSS_ACCESS_KEY_ID
+#   OSS_ACCESS_KEY_SECRET
+access_key_id = ""
+access_key_secret = ""
+
+# Optional: used to build readable object URLs in upload summary.
+public_base_url = "https://your-bucket-name.oss-cn-hangzhou.aliyuncs.com"
+
+# Optional, explicit provider ("aliyun" or "s3"). Auto-detected if omitted.
+provider = "aliyun"
