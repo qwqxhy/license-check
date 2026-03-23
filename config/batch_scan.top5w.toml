@@ -24,6 +24,7 @@ lc_all = "C.UTF-8"
 scancode_cache = "/tmp/scancode-cache"
 scancode_temp = "/tmp/scancode-tmp"
 license_scan_backend = "auto"
+repo_max_unpacked_bytes = 209715200
 
 [github]
 default_ref = ""

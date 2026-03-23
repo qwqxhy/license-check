@@ -8,9 +8,7 @@ repos_file = "/root/lanyun-tmp/license-check/config/repos120w.jsonl"
 
 batch_size = 100
 clone_workers = 16
-candidate_workers = 16
 scan_workers = 16
-candidate_timeout_sec = 100
 scan_timeout_sec = 180
 shuffle_seed = 20260321
 shuffle_bucket_count = 256
@@ -28,8 +26,7 @@ lc_all = "C.UTF-8"
 scancode_cache = "/tmp/scancode-cache"
 scancode_temp = "/tmp/scancode-tmp"
 license_scan_backend = "scancode"
-scan_max_candidate_files = 512
-scan_max_candidate_bytes = 100000000
+repo_max_unpacked_bytes = 209715200
 
 [github]
 default_ref = ""
