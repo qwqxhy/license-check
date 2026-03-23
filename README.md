@@ -51,7 +51,11 @@ export LANG=C.UTF-8
 export LC_ALL=C.UTF-8
 export SCANCODE_CACHE=/tmp/scancode-cache
 export SCANCODE_TEMP=/tmp/scancode-tmp
+export LICENSE_SCAN_BACKEND=auto
 ```
+
+`LICENSE_SCAN_BACKEND` supports `auto`, `fast`, and `scancode`.
+`auto` runs the lightweight scanner first and falls back to ScanCode only when needed.
 
 Start MongoDB if needed:
 

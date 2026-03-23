@@ -23,6 +23,7 @@ lang = "C.UTF-8"
 lc_all = "C.UTF-8"
 scancode_cache = "/tmp/scancode-cache"
 scancode_temp = "/tmp/scancode-tmp"
+license_scan_backend = "auto"
 
 [github]
 default_ref = ""
@@ -42,7 +43,7 @@ bucket = "yuantu"
 token_url = "https://sso.ossp.yuantu.ac.cn/auth/realms/ossp/protocol/openid-connect/token"
 repo_info_url = "https://ossp.yuantu.ac.cn/openapi/repository/info/filepath"
 client_id = "sec-team"
-client_secret = "b733ffc0-1939-490b-bff0-ee2e6097a4c6"
+client_secret = ""
 # Prefer env vars in production:
 #   MIRROR_CLIENT_ID
 #   MIRROR_CLIENT_SECRET
@@ -50,8 +51,8 @@ client_secret = "b733ffc0-1939-490b-bff0-ee2e6097a4c6"
 #   MINIO_SECRET_KEY
 client_id_env = "MIRROR_CLIENT_ID"
 client_secret_env = "MIRROR_CLIENT_SECRET"
-access_key = "Y69WFP101162LTDWT8FS"
-secret_key = "1QABMo9azeBfVzTdLDkRbmhgZ0pcqgsn2A36Azua"
+access_key = ""
+secret_key = ""
 access_key_env = "MINIO_ACCESS_KEY"
 secret_key_env = "MINIO_SECRET_KEY"
 
@@ -70,7 +71,7 @@ ssh_key = "/home/huayuan/.ssh/id_ed25519"
 # Optional password auth (requires sshpass installed):
 use_sshpass = false
 password_env = "REMOTE_PASSWORD"
-password = "huayuan123"
+password = ""
 
 [GITHUB_FETCH]
 # Build repository list (1w by default) with resume support.

@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-from scancode import cli
 import os
 import traceback
 
+from light_scan import append_scan_error, run_fast_scan
 from ltree import LTree
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -12,12 +12,21 @@ RESULT_DIR =os.path.join(CURRENT_DIR, 'result')
 
 ignores_pattern = (
     '.git/', '.github/', '.idea/',
-    '*.pdf', '*.jpg', '*.jpeg', '*.png', '*.gif', '*.bmp',
-    '*.mp3', '*.mp4', '*.avi', '*.WAV', '*.MOV', '*.mid', '*.cda', '*.rmvb',
+    'node_modules/', 'dist/', 'build/', 'target/', '.next/', '.nuxt/', '.cache/', '__pycache__/',
+    '*.min.js', '*.min.css',
+    '*.pdf', '*.jpg', '*.jpeg', '*.png', '*.webp', '*.avif', '*.ico', '*.svgz', '*.gif', '*.bmp', '*.tif', '*.tiff', '*.psd',
+    '*.mp3', '*.mp4', '*.avi', '*.mkv', '*.flv', '*.webm', '*.wav', '*.WAV', '*.ogg', '*.MOV', '*.mov', '*.mid', '*.cda', '*.rmvb',
+    '*.zip', '*.tar', '*.gz', '*.bz2', '*.xz', '*.7z', '*.rar', '*.jar', '*.war', '*.ear',
+    '*.class', '*.exe', '*.dll', '*.so', '*.dylib',
+    '*.woff', '*.woff2', '*.ttf', '*.otf', '*.eot',
+    '*.parquet', '*.feather', '*.npy', '*.npz', '*.pkl', '*.pickle',
+    '*.ipynb', '*.html', '*.htm',
 )
 
 
 def _run_scancode(path):
+    from scancode import cli  # pylint: disable=import-outside-toplevel
+
     # Keep only options required by ltree field dependencies:
     # - info: path/type/base_name/extension/is_top_level etc.
     # - classify: is_legal/is_readme/is_manifest.
@@ -39,6 +48,37 @@ def _run_scancode(path):
         return_results=True,
         processes=0,
     )
+
+
+def _scan_backend() -> str:
+    backend = os.getenv("LICENSE_SCAN_BACKEND", "auto").strip().lower()
+    if backend in {"fast", "scancode", "auto"}:
+        return backend
+    return "auto"
+
+
+def _run_scan(path):
+    backend = _scan_backend()
+    if backend == "scancode":
+        rc, results = _run_scancode(path)
+        results["scan_backend"] = "scancode"
+        return rc, results
+
+    _rc, fast_results, fast_meta = run_fast_scan(path, ignores_pattern)
+    if backend == "fast" or not fast_meta["needs_fallback"]:
+        return 0, fast_results
+
+    try:
+        rc, results = _run_scancode(path)
+        results["scan_backend"] = "scancode"
+        results["scan_meta"] = {"fallback_from": "fast", "fallback_reasons": fast_meta["fallback_reasons"]}
+        return rc, results
+    except Exception:
+        append_scan_error(
+            fast_results,
+            "fast scan requested scancode fallback but scancode is unavailable; using fast result only",
+        )
+        return 0, fast_results
 
 
 def _collect_scan_errors(results):
@@ -79,7 +119,7 @@ def license_check(codebase):
             path = os.path.join(codebase, file)
 
     try:
-        rc, results = _run_scancode(path)
+        rc, results = _run_scan(path)
     except Exception:
         success = False
         message = 'scancode cli error: {}: \nException: {}'.format(codebase, traceback.format_exc())
@@ -103,6 +143,7 @@ def license_check(codebase):
     success = success and detect_success
     if detect_success:
         result = ltree.get_result()
+        result["scan_backend"] = results.get("scan_backend", _scan_backend())
         if scan_errors:
             result["scan_errors"] = scan_errors
             result["scan_error_count"] = len(scan_errors)

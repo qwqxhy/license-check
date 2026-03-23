@@ -4,15 +4,19 @@
 #   https://github.com/org/repo.git
 #   https://github.com/org/repo.git,main
 #   https://github.com/org/repo.git main
-repos_file = "config/repos.top5w.txt"
+repos_file = "/root/lanyun-tmp/license-check/config/repos120w.jsonl"
 
 batch_size = 100
-clone_workers = 8
+clone_workers = 16
+candidate_workers = 16
 scan_workers = 16
-scan_timeout_sec = 1800
+candidate_timeout_sec = 100
+scan_timeout_sec = 180
+shuffle_seed = 20260321
+shuffle_bucket_count = 256
 
 # Temporary working root for this batch pipeline.
-work_dir = "/home/huayuan/workspace/storage/local-run"
+work_dir = "/root/lanyun-tmp/license-check/runtime/local-run"
 
 # Cleanup policy
 cleanup_clone_after_batch = true
@@ -23,16 +27,19 @@ lang = "C.UTF-8"
 lc_all = "C.UTF-8"
 scancode_cache = "/tmp/scancode-cache"
 scancode_temp = "/tmp/scancode-tmp"
+license_scan_backend = "scancode"
+scan_max_candidate_files = 512
+scan_max_candidate_bytes = 100000000
 
 [github]
 default_ref = ""
 git_clone_depth = 1
-clone_timeout_sec = 1800
+clone_timeout_sec = 180
 
 [state]
 # Persist scan status. successful repos are skipped on restart.
 enabled = true
-db_path = "/home/huayuan/workspace/license-check-master/runtime/scan_state.db"
+db_path = "/root/lanyun-tmp/license-check/runtime/scan_state.db"
 
 [MIRROR]
 # Resolve GitHub ZIP paths via the OSSP API, then download from S3/MinIO.
@@ -42,7 +49,7 @@ bucket = "yuantu"
 token_url = "https://sso.ossp.yuantu.ac.cn/auth/realms/ossp/protocol/openid-connect/token"
 repo_info_url = "https://ossp.yuantu.ac.cn/openapi/repository/info/filepath"
 client_id = "sec-team"
-client_secret = "b733ffc0-1939-490b-bff0-ee2e6097a4c6"
+client_secret = ""
 # Prefer env vars in production:
 #   MIRROR_CLIENT_ID
 #   MIRROR_CLIENT_SECRET
@@ -50,14 +57,14 @@ client_secret = "b733ffc0-1939-490b-bff0-ee2e6097a4c6"
 #   MINIO_SECRET_KEY
 client_id_env = "MIRROR_CLIENT_ID"
 client_secret_env = "MIRROR_CLIENT_SECRET"
-access_key = "Y69WFP101162LTDWT8FS"
-secret_key = "1QABMo9azeBfVzTdLDkRbmhgZ0pcqgsn2A36Azua"
+access_key = ""
+secret_key = ""
 access_key_env = "MINIO_ACCESS_KEY"
 secret_key_env = "MINIO_SECRET_KEY"
 
 [REMOTE]
 # Sync results/logs to a remote server via rsync over SSH.
-enabled = true
+enabled = false
 host = "10.211.152.12"
 port = 22
 user = "huayuan"
@@ -65,12 +72,12 @@ base_dir = "/home/huayuan/workspace/storage"
 
 # Prefer SSH key auth:
 # ssh_key = "/home/huayuan/.ssh/id_rsa"
-ssh_key = "/home/huayuan/.ssh/id_ed25519"
+ssh_key = "/root/.ssh/id_ed25519"
 
 # Optional password auth (requires sshpass installed):
 use_sshpass = false
 password_env = "REMOTE_PASSWORD"
-password = "huayuan123"
+password = ""
 
 [GITHUB_FETCH]
 # Build repository list (1w by default) with resume support.
@@ -88,18 +95,18 @@ token = ""
 [mongodb]
 host = "127.0.0.1"
 port = 27037
-user = ""
+user = "sca"
 password = ""
 db = "sca"
 url = "mongodb://127.0.0.1:27037/sca"
 
 [OSS]
 # Set to true in production.
-enabled = false
+enabled = true
 
 # Aliyun OSS endpoint (scheme optional)
 endpoint = "oss-cn-hangzhou.aliyuncs.com"
-bucket = "your-bucket-name"
+bucket = "ai-live-review-storage"
 prefix = "license-check-results"
 
 # Prefer environment variables in production:

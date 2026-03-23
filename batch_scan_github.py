@@ -30,7 +30,7 @@ import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
@@ -43,6 +43,77 @@ DEFAULT_MIRROR_PREFIX = "github"
 DISPLAY_TZ = ZoneInfo("Asia/Shanghai")
 _MIRROR_CLIENT = None
 _MIRROR_TOKEN_CACHE: Dict[str, Any] = {"token": "", "expires_at": 0.0}
+DEFAULT_SCAN_IGNORE_PATTERNS = (
+    ".git/",
+    ".github/",
+    ".idea/",
+    "node_modules/",
+    "dist/",
+    "build/",
+    "target/",
+    ".next/",
+    ".nuxt/",
+    ".cache/",
+    "__pycache__/",
+    "*.min.js",
+    "*.min.css",
+    "*.pdf",
+    "*.jpg",
+    "*.jpeg",
+    "*.png",
+    "*.webp",
+    "*.avif",
+    "*.ico",
+    "*.svgz",
+    "*.gif",
+    "*.bmp",
+    "*.tif",
+    "*.tiff",
+    "*.psd",
+    "*.mp3",
+    "*.mp4",
+    "*.avi",
+    "*.mkv",
+    "*.flv",
+    "*.webm",
+    "*.wav",
+    "*.WAV",
+    "*.ogg",
+    "*.MOV",
+    "*.mov",
+    "*.mid",
+    "*.cda",
+    "*.rmvb",
+    "*.zip",
+    "*.tar",
+    "*.gz",
+    "*.bz2",
+    "*.xz",
+    "*.7z",
+    "*.rar",
+    "*.jar",
+    "*.war",
+    "*.ear",
+    "*.class",
+    "*.exe",
+    "*.dll",
+    "*.so",
+    "*.dylib",
+    "*.woff",
+    "*.woff2",
+    "*.ttf",
+    "*.otf",
+    "*.eot",
+    "*.parquet",
+    "*.feather",
+    "*.npy",
+    "*.npz",
+    "*.pkl",
+    "*.pickle",
+    "*.ipynb",
+    "*.html",
+    "*.htm",
+)
 
 
 @dataclass(frozen=True)
@@ -242,9 +313,15 @@ def ensure_dir(path: Path) -> Path:
     return path
 
 
-def chunked(items: Sequence[RepoTask], size: int) -> Iterable[List[RepoTask]]:
-    for i in range(0, len(items), size):
-        yield list(items[i : i + size])
+def chunked_iter(items: Iterable[RepoTask], size: int) -> Iterator[List[RepoTask]]:
+    batch: List[RepoTask] = []
+    for item in items:
+        batch.append(item)
+        if len(batch) >= size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
 
 
 def parse_repo_line(line: str) -> Optional[Tuple[str, Optional[str]]]:
@@ -289,16 +366,14 @@ def parse_repo_line(line: str) -> Optional[Tuple[str, Optional[str]]]:
     return url, ref
 
 
-def load_repo_tasks(repos_file: Path) -> List[RepoTask]:
-    tasks: List[RepoTask] = []
+def iter_repo_tasks(repos_file: Path) -> Iterator[RepoTask]:
     with repos_file.open("r", encoding="utf-8") as f:
         for line_idx, line in enumerate(f, start=1):
             parsed = parse_repo_line(line)
             if not parsed:
                 continue
             url, ref = parsed
-            tasks.append(RepoTask(index=line_idx, url=url, ref=ref))
-    return tasks
+            yield RepoTask(index=line_idx, url=url, ref=ref)
 
 
 def task_ref_value(ref: Optional[str]) -> str:
@@ -309,16 +384,110 @@ def task_key(url: str, ref: Optional[str]) -> str:
     return f"{url}@@{task_ref_value(ref)}"
 
 
-def dedupe_tasks(tasks: Sequence[RepoTask]) -> List[RepoTask]:
-    seen = set()
-    out: List[RepoTask] = []
-    for t in tasks:
-        key = task_key(t.url, t.ref)
-        if key in seen:
+def completed_state_statuses() -> Tuple[str, ...]:
+    return ("success", "scan_failed", "scan_skipped")
+
+
+def is_task_completed(conn: sqlite3.Connection, url: str, ref: Optional[str]) -> bool:
+    statuses = completed_state_statuses()
+    placeholders = ", ".join("?" for _ in statuses)
+    row = conn.execute(
+        f"SELECT 1 FROM repo_state WHERE repo_url = ? AND repo_ref = ? AND status IN ({placeholders}) LIMIT 1",
+        (url, task_ref_value(ref), *statuses),
+    ).fetchone()
+    return row is not None
+
+
+def _shuffle_key(task: RepoTask, seed: int) -> str:
+    raw = f"{seed}\t{task.url}\t{task_ref_value(task.ref)}".encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()
+
+
+def prepare_task_buckets(
+    repos_file: Path,
+    spool_dir: Path,
+    shuffle_seed: int,
+    shuffle_bucket_count: int,
+    state_db_path: Path,
+    state_enabled: bool,
+) -> Dict[str, Any]:
+    spool_dir.mkdir(parents=True, exist_ok=True)
+    bucket_count = max(1, int(shuffle_bucket_count))
+    bucket_paths = [spool_dir / f"bucket_{idx:04d}.jsonl" for idx in range(bucket_count)]
+    seen_db_path = spool_dir / "seen_tasks.sqlite3"
+    seen_conn = sqlite3.connect(str(seen_db_path))
+    state_conn = sqlite3.connect(str(state_db_path)) if state_enabled and state_db_path.exists() else None
+    stats = {
+        "input_total": 0,
+        "accepted_total": 0,
+        "duplicate_total": 0,
+        "skipped_completed": 0,
+    }
+    try:
+        seen_conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS seen_tasks (
+                repo_url TEXT NOT NULL,
+                repo_ref TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (repo_url, repo_ref)
+            )
+            """
+        )
+        seen_conn.commit()
+        bucket_files = [path.open("w", encoding="utf-8") for path in bucket_paths]
+        try:
+            for task in iter_repo_tasks(repos_file):
+                stats["input_total"] += 1
+                inserted = seen_conn.execute(
+                    "INSERT OR IGNORE INTO seen_tasks (repo_url, repo_ref) VALUES (?, ?)",
+                    (task.url, task_ref_value(task.ref)),
+                ).rowcount
+                if not inserted:
+                    stats["duplicate_total"] += 1
+                    continue
+                if state_conn is not None and is_task_completed(state_conn, task.url, task.ref):
+                    stats["skipped_completed"] += 1
+                    continue
+                sort_key = _shuffle_key(task, shuffle_seed)
+                bucket_idx = int(sort_key[:8], 16) % bucket_count
+                payload = {
+                    "sort_key": sort_key,
+                    "index": task.index,
+                    "url": task.url,
+                    "ref": task.ref,
+                }
+                bucket_files[bucket_idx].write(json.dumps(payload, ensure_ascii=False) + "\n")
+                stats["accepted_total"] += 1
+            seen_conn.commit()
+        finally:
+            for fh in bucket_files:
+                fh.close()
+    finally:
+        seen_conn.close()
+        if state_conn is not None:
+            state_conn.close()
+
+    bucket_order = list(range(bucket_count))
+    bucket_order.sort(key=lambda idx: hashlib.sha1(f"{shuffle_seed}:{idx}".encode("utf-8")).hexdigest())
+    stats["bucket_paths"] = [str(bucket_paths[idx]) for idx in bucket_order if bucket_paths[idx].exists()]
+    return stats
+
+
+def iter_bucketed_tasks(bucket_paths: Sequence[str]) -> Iterator[RepoTask]:
+    for bucket_path_str in bucket_paths:
+        bucket_path = Path(bucket_path_str)
+        if not bucket_path.exists():
             continue
-        seen.add(key)
-        out.append(t)
-    return out
+        rows: List[Dict[str, Any]] = []
+        with bucket_path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                rows.append(json.loads(stripped))
+        rows.sort(key=lambda item: (item["sort_key"], int(item["index"])))
+        for item in rows:
+            yield RepoTask(index=int(item["index"]), url=str(item["url"]), ref=item.get("ref"))
 
 
 def init_state_db(db_path: Path) -> None:
@@ -349,8 +518,11 @@ def load_completed_keys(db_path: Path) -> set[str]:
         return set()
     conn = sqlite3.connect(str(db_path))
     try:
+        statuses = completed_state_statuses()
+        placeholders = ", ".join("?" for _ in statuses)
         rows = conn.execute(
-            "SELECT repo_url, repo_ref FROM repo_state WHERE status IN ('success', 'scan_failed')"
+            f"SELECT repo_url, repo_ref FROM repo_state WHERE status IN ({placeholders})",
+            statuses,
         ).fetchall()
         return {task_key(url, ref) for (url, ref) in rows}
     finally:
@@ -401,6 +573,56 @@ def append_log_line(path: Path, line: str) -> None:
         f.write(line.rstrip("\n") + "\n")
 
 
+def count_scan_candidates(repo_path: str) -> Tuple[Optional[int], Optional[int], Optional[str]]:
+    """
+    Count candidate files using ScanCode's own traversal and ignore handling.
+    This avoids local heuristics and keeps thresholding aligned with ScanCode input.
+    """
+    try:
+        from scancode import cli  # pylint: disable=import-outside-toplevel
+    except Exception as e:  # noqa: BLE001
+        return None, None, f"import scancode failed: {type(e).__name__}: {e}"
+
+    try:
+        with open(os.devnull, "w", encoding="utf-8") as devnull:
+            with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+                _rc, results = cli.run_scan(
+                    repo_path,
+                    license=False,
+                    info=True,
+                    classify=False,
+                    include=("*",),
+                    ignore=DEFAULT_SCAN_IGNORE_PATTERNS,
+                    facet=(),
+                    strip_root=True,
+                    return_results=True,
+                    processes=0,
+                )
+    except Exception as e:  # noqa: BLE001
+        return None, None, f"scancode candidate counting failed: {type(e).__name__}: {e}"
+
+    files = results.get("files", [])
+    total_files = 0
+    total_bytes = 0
+    for entry in files:
+        if isinstance(entry, dict) and entry.get("type") == "file":
+            total_files += 1
+            size = entry.get("size")
+            if isinstance(size, int):
+                total_bytes += size
+    return total_files, total_bytes, None
+
+
+def should_skip_for_mirror(message: str) -> bool:
+    lower_message = message.lower()
+    return (
+        "mirror repo info missing s3zipfilepath" in lower_message
+        or "mirror lookup failed: runtimeerror: mirror repo info missing s3zipfilepath" in lower_message
+        or "nosuchkey" in lower_message
+        or "not found" in lower_message and "mirror" in lower_message
+    )
+
+
 def run_cmd(
     cmd: Sequence[str],
     timeout_sec: int,
@@ -439,6 +661,7 @@ def clone_one(
             return {
                 "task": task,
                 "success": False,
+                "skipped": should_skip_for_mirror(f"mirror lookup failed: {type(e).__name__}: {e}"),
                 "repo_path": None,
                 "duration_sec": round(time.time() - started, 3),
                 "message": f"mirror lookup failed: {type(e).__name__}: {e}",
@@ -449,6 +672,7 @@ def clone_one(
             return {
                 "task": task,
                 "success": False,
+                "skipped": False,
                 "repo_path": None,
                 "duration_sec": round(time.time() - started, 3),
                 "message": "mirror bucket is empty",
@@ -462,6 +686,7 @@ def clone_one(
             return {
                 "task": task,
                 "success": False,
+                "skipped": should_skip_for_mirror(f"mirror download/extract failed: {zip_key}: {type(e).__name__}: {e}"),
                 "repo_path": None,
                 "duration_sec": round(time.time() - started, 3),
                 "message": f"mirror download/extract failed: {zip_key}: {type(e).__name__}: {e}",
@@ -473,6 +698,7 @@ def clone_one(
         return {
             "task": task,
             "success": True,
+            "skipped": False,
             "repo_path": str(repo_root),
             "duration_sec": round(time.time() - started, 3),
             "message": f"ok (mirror: {zip_key})",
@@ -486,6 +712,7 @@ def clone_one(
         return {
             "task": task,
             "success": False,
+            "skipped": False,
             "repo_path": None,
             "duration_sec": round(time.time() - started, 3),
             "message": f"git clone timeout after {clone_timeout_sec}s",
@@ -494,6 +721,7 @@ def clone_one(
         return {
             "task": task,
             "success": False,
+            "skipped": False,
             "repo_path": None,
             "duration_sec": round(time.time() - started, 3),
             "message": f"git clone failed: {cp.stderr.strip()[:500]}",
@@ -510,6 +738,7 @@ def clone_one(
             return {
                 "task": task,
                 "success": False,
+                "skipped": False,
                 "repo_path": None,
                 "duration_sec": round(time.time() - started, 3),
                 "message": f"git checkout timeout after {clone_timeout_sec}s",
@@ -518,6 +747,7 @@ def clone_one(
             return {
                 "task": task,
                 "success": False,
+                "skipped": False,
                 "repo_path": None,
                 "duration_sec": round(time.time() - started, 3),
                 "message": f"git checkout failed: {cp_ref.stderr.strip()[:500]}",
@@ -526,6 +756,7 @@ def clone_one(
     return {
         "task": task,
         "success": True,
+        "skipped": False,
         "repo_path": str(target),
         "duration_sec": round(time.time() - started, 3),
         "message": "ok",
@@ -558,6 +789,51 @@ def _scan_worker(repo_path: str, queue: "mp.Queue[Tuple[bool, Dict[str, Any], st
         results = {}
         message = f"unexpected worker error: {type(e).__name__}: {e}"
     queue.put((success, results, message))
+
+
+def _candidate_worker(repo_path: str, queue: "mp.Queue[Tuple[Optional[int], Optional[int], Optional[str]]]") -> None:
+    try:
+        with open(os.devnull, "w", encoding="utf-8") as devnull:
+            with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+                candidate_file_count, candidate_total_bytes, candidate_count_err = count_scan_candidates(repo_path)
+    except Exception as e:  # noqa: BLE001
+        candidate_file_count = None
+        candidate_total_bytes = None
+        candidate_count_err = f"candidate worker error: {type(e).__name__}: {e}"
+    queue.put((candidate_file_count, candidate_total_bytes, candidate_count_err))
+
+
+def candidate_one(args: Tuple[str, int]) -> Dict[str, Any]:
+    repo_path, candidate_timeout_sec = args
+    started = time.time()
+    if candidate_timeout_sec > 0:
+        queue: "mp.Queue[Tuple[Optional[int], Optional[int], Optional[str]]]" = mp.Queue()
+        proc = mp.Process(target=_candidate_worker, args=(repo_path, queue))
+        proc.start()
+        proc.join(timeout=candidate_timeout_sec)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=5)
+            candidate_file_count = None
+            candidate_total_bytes = None
+            candidate_count_err = f"candidate counting timeout after {candidate_timeout_sec}s"
+        else:
+            try:
+                candidate_file_count, candidate_total_bytes, candidate_count_err = queue.get_nowait()
+            except Exception:  # noqa: BLE001
+                candidate_file_count = None
+                candidate_total_bytes = None
+                candidate_count_err = "candidate worker exited without result"
+    else:
+        candidate_file_count, candidate_total_bytes, candidate_count_err = count_scan_candidates(repo_path)
+
+    return {
+        "repo_path": repo_path,
+        "candidate_file_count": candidate_file_count,
+        "candidate_total_bytes": candidate_total_bytes,
+        "candidate_count_err": candidate_count_err,
+        "duration_sec": round(time.time() - started, 3),
+    }
 
 
 def scan_one(args: Tuple[RepoTask, str, str, int]) -> Dict[str, Any]:
@@ -872,8 +1148,15 @@ def main() -> int:
     batch_size = int(run_cfg.get("batch_size", 100))
     clone_workers = int(run_cfg.get("clone_workers", 8))
     scan_workers = int(run_cfg.get("scan_workers", os.cpu_count() or 4))
+    candidate_workers = int(run_cfg.get("candidate_workers", scan_workers))
     scan_progress_step = int(run_cfg.get("scan_progress_step", 10))
+    candidate_progress_step = int(run_cfg.get("candidate_progress_step", 10))
+    candidate_timeout_sec = int(run_cfg.get("candidate_timeout_sec", 100))
     scan_timeout_sec = int(run_cfg.get("scan_timeout_sec", 0))
+    scan_max_candidate_files = int(run_cfg.get("scan_max_candidate_files", run_cfg.get("scan_max_files", 0)))
+    scan_max_candidate_bytes = int(run_cfg.get("scan_max_candidate_bytes", 0))
+    shuffle_seed = int(run_cfg.get("shuffle_seed", 20260321))
+    shuffle_bucket_count = int(run_cfg.get("shuffle_bucket_count", 256))
     clone_timeout_sec = int(github_cfg.get("clone_timeout_sec", 1800))
     git_clone_depth = int(github_cfg.get("git_clone_depth", 1))
     cleanup_clone = bool(run_cfg.get("cleanup_clone_after_batch", True))
@@ -886,33 +1169,45 @@ def main() -> int:
     clone_root = ensure_dir(run_dir / "clones")
     result_root = ensure_dir(run_dir / "results")
     manifest_root = ensure_dir(run_dir / "manifests")
+    spool_root = ensure_dir(run_dir / "task_spool")
     timeout_log_path = run_dir / "scan_timeouts.log"
+    mirror_skip_log_path = run_dir / "mirror_skips.log"
+    file_limit_skip_log_path = run_dir / "scan_candidate_file_limit_skips.log"
     remote_cfg = resolve_remote_config(merged_section(cfg, "remote", "REMOTE"), run_id)
-
-    tasks = dedupe_tasks(load_repo_tasks(repos_file))
-    default_ref = github_cfg.get("default_ref")
-    if default_ref:
-        tasks = dedupe_tasks(
-            [RepoTask(index=t.index, url=t.url, ref=t.ref or default_ref) for t in tasks]
-        )
-
-    skipped_completed = 0
     state_db_path = Path(state_cfg["db_path"])
     if state_cfg["enabled"]:
         init_state_db(state_db_path)
-        done_keys = load_completed_keys(state_db_path)
-        before = len(tasks)
-        tasks = [t for t in tasks if task_key(t.url, t.ref) not in done_keys]
-        skipped_completed = before - len(tasks)
+    task_prep = prepare_task_buckets(
+        repos_file=repos_file,
+        spool_dir=spool_root,
+        shuffle_seed=shuffle_seed,
+        shuffle_bucket_count=shuffle_bucket_count,
+        state_db_path=state_db_path,
+        state_enabled=bool(state_cfg["enabled"]),
+    )
 
     print(f"config: {cfg_path}")
     print(f"repos: {repos_file}")
-    print(f"total_tasks: {len(tasks)}")
+    print(f"input_tasks: {task_prep['input_total']}")
+    print(
+        f"total_tasks: {task_prep['accepted_total']} "
+        f"(duplicates={task_prep['duplicate_total']} skipped_completed={task_prep['skipped_completed']})"
+    )
     if state_cfg["enabled"]:
-        print(f"state_db: {state_db_path} (skip_success={skipped_completed})")
-        print(f"batch_size: {batch_size}, clone_workers: {clone_workers}, scan_workers: {scan_workers}")
-        if scan_timeout_sec > 0:
-            print(f"scan_timeout_sec: {scan_timeout_sec}")
+        print(f"state_db: {state_db_path}")
+        print(
+            f"batch_size: {batch_size}, clone_workers: {clone_workers}, "
+            f"candidate_workers: {candidate_workers}, scan_workers: {scan_workers}"
+        )
+    if candidate_timeout_sec > 0:
+        print(f"candidate_timeout_sec: {candidate_timeout_sec}")
+    if scan_timeout_sec > 0:
+        print(f"scan_timeout_sec: {scan_timeout_sec}")
+    if scan_max_candidate_files > 0:
+        print(f"scan_max_candidate_files: {scan_max_candidate_files}")
+    if scan_max_candidate_bytes > 0:
+        print(f"scan_max_candidate_bytes: {scan_max_candidate_bytes}")
+    print(f"shuffle_seed: {shuffle_seed}, shuffle_bucket_count: {shuffle_bucket_count}")
     print(f"run_dir: {run_dir}")
     if mirror_cfg.get("enabled"):
         print(f"mirror: {mirror_cfg.get('endpoint_url')} bucket={mirror_cfg.get('bucket')} prefix={mirror_cfg.get('prefix')}")
@@ -930,6 +1225,7 @@ def main() -> int:
         "LC_ALL": run_cfg.get("lc_all", DEFAULT_LANG),
         "SCANCODE_CACHE": run_cfg.get("scancode_cache", "/tmp/scancode-cache"),
         "SCANCODE_TEMP": run_cfg.get("scancode_temp", "/tmp/scancode-tmp"),
+        "LICENSE_SCAN_BACKEND": str(run_cfg.get("license_scan_backend", "auto")),
         "MONGODB_HOST": str(mongo_cfg.get("host", "")),
         "MONGODB_PORT": str(mongo_cfg.get("port", "")),
         "MONGODB_USER": str(mongo_cfg.get("user", "")),
@@ -937,20 +1233,34 @@ def main() -> int:
         "MONGODB_DB": str(mongo_cfg.get("db", "")),
         "MONGODB_URL": str(mongo_cfg.get("url", "")),
     }
+    for key, value in env_overrides.items():
+        if value:
+            os.environ[key] = value
 
     src_dir = str((Path(__file__).resolve().parent / "src").resolve())
     overall = {
         "run_id": run_id,
         "started_at": now_iso(),
         "finished_at": None,
-        "total_tasks": len(tasks),
+        "total_tasks": int(task_prep["accepted_total"]),
+        "input_tasks": int(task_prep["input_total"]),
+        "duplicate_tasks": int(task_prep["duplicate_total"]),
+        "skipped_completed": int(task_prep["skipped_completed"]),
         "total_success": 0,
         "total_failed": 0,
+        "total_skipped": 0,
         "batches": [],
     }
 
     batch_count = 0
-    for batch_idx, batch_tasks in enumerate(chunked(tasks, batch_size), start=1):
+    task_iter = iter_bucketed_tasks(task_prep["bucket_paths"])
+    default_ref = github_cfg.get("default_ref")
+    if default_ref:
+        task_iter = (
+            RepoTask(index=t.index, url=t.url, ref=t.ref or default_ref)
+            for t in task_iter
+        )
+    for batch_idx, batch_tasks in enumerate(chunked_iter(task_iter, batch_size), start=1):
         batch_count += 1
         batch_started = time.time()
         batch_name = f"batch_{batch_idx:06d}"
@@ -959,6 +1269,7 @@ def main() -> int:
         batch_manifest = manifest_root / f"{batch_name}.json"
 
         print(f"[{batch_name}] cloning {len(batch_tasks)} repos...")
+        clone_phase_started = time.time()
         clone_results: List[Dict[str, Any]] = []
         with futures.ThreadPoolExecutor(max_workers=clone_workers) as ex:
             futs = [
@@ -974,23 +1285,27 @@ def main() -> int:
             ]
             for fut in futures.as_completed(futs):
                 clone_results.append(fut.result())
+        clone_phase_sec = round(time.time() - clone_phase_started, 3)
 
-        to_scan: List[Tuple[RepoTask, str, str]] = []
+        to_scan: List[Tuple[RepoTask, str, str, int]] = []
         records: List[Dict[str, Any]] = []
+        scan_candidates: List[Tuple[RepoTask, str, Path, float]] = []
         for item in clone_results:
             task = item["task"]
             result_file = batch_result_dir / f"{repo_slug(task)}.json"
             if not item["success"]:
+                stage = "clone_skipped" if item.get("skipped") else "clone"
                 failed_record = {
                     "repo_url": task.url,
                     "repo_ref": task.ref,
                     "repo_path": None,
                     "success": False,
+                    "skipped": bool(item.get("skipped")),
                     "message": item["message"],
                     "duration_sec": item["duration_sec"],
                     "finished_at": now_iso(),
                     "results": {},
-                    "stage": "clone",
+                    "stage": stage,
                 }
                 write_json(result_file, failed_record)
                 records.append(
@@ -999,25 +1314,247 @@ def main() -> int:
                         "repo_ref": task.ref,
                         "repo_path": None,
                         "success": False,
+                        "skipped": bool(item.get("skipped")),
                         "message": item["message"],
                         "duration_sec": item["duration_sec"],
                         "result_file": str(result_file),
-                        "stage": "clone",
+                        "stage": stage,
                     }
                 )
+                if item.get("skipped"):
+                    append_log_line(
+                        mirror_skip_log_path,
+                        json.dumps(
+                            {
+                                "batch": batch_name,
+                                "repo_url": task.url,
+                                "repo_ref": task.ref,
+                                "message": item["message"],
+                                "finished_at": now_iso(),
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
                 if state_cfg["enabled"]:
                     update_repo_state(
                         db_path=state_db_path,
                         repo_url=task.url,
                         repo_ref=task.ref,
-                        status="clone_failed",
+                        status="clone_skipped" if item.get("skipped") else "clone_failed",
                         message=item["message"],
                         run_id=run_id,
                         result_file=str(result_file),
                     )
                 continue
-            to_scan.append((task, item["repo_path"], str(result_file), scan_timeout_sec))
+            repo_path = str(item["repo_path"])
+            scan_candidates.append((task, repo_path, result_file, float(item["duration_sec"])))
 
+        candidate_phase_started = time.time()
+        candidate_phase_sec = 0.0
+        candidate_results: Dict[str, Dict[str, Any]] = {}
+        if scan_candidates and (scan_max_candidate_files > 0 or scan_max_candidate_bytes > 0):
+            print(f"[{batch_name}] counting scan candidates for {len(scan_candidates)} repos in parallel...")
+            candidate_done = 0
+            with futures.ThreadPoolExecutor(max_workers=max(1, candidate_workers)) as ex:
+                submitted = {
+                    ex.submit(candidate_one, (repo_path, candidate_timeout_sec)): repo_path
+                    for _task, repo_path, _result_file, _clone_duration in scan_candidates
+                }
+                for fut in futures.as_completed(submitted):
+                    repo_path = submitted[fut]
+                    try:
+                        result = fut.result()
+                    except Exception as e:  # noqa: BLE001
+                        result = {
+                            "repo_path": repo_path,
+                            "candidate_file_count": None,
+                            "candidate_total_bytes": None,
+                            "candidate_count_err": f"candidate future error: {type(e).__name__}: {e}",
+                            "duration_sec": 0.0,
+                        }
+                    candidate_results[repo_path] = result
+                    candidate_done += 1
+                    if candidate_done == len(scan_candidates) or (
+                        candidate_progress_step > 0 and candidate_done % candidate_progress_step == 0
+                    ):
+                        print(f"[{batch_name}] candidate progress: {candidate_done}/{len(scan_candidates)}")
+            candidate_phase_sec = round(time.time() - candidate_phase_started, 3)
+
+        for task, repo_path, result_file, clone_duration_sec in scan_candidates:
+            candidate_result = candidate_results.get(repo_path, {})
+            candidate_file_count = candidate_result.get("candidate_file_count")
+            candidate_total_bytes = candidate_result.get("candidate_total_bytes")
+            candidate_count_err = candidate_result.get("candidate_count_err")
+            candidate_duration_sec = float(candidate_result.get("duration_sec", 0.0) or 0.0)
+            if scan_max_candidate_files > 0 or scan_max_candidate_bytes > 0:
+                if candidate_count_err:
+                    append_log_line(
+                        file_limit_skip_log_path,
+                        json.dumps(
+                            {
+                                "batch": batch_name,
+                                "repo_url": task.url,
+                                "repo_ref": task.ref,
+                                "repo_path": repo_path,
+                                "candidate_file_count": candidate_file_count,
+                                "candidate_total_bytes": candidate_total_bytes,
+                                "candidate_duration_sec": candidate_duration_sec,
+                                "message": candidate_count_err,
+                                "finished_at": now_iso(),
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
+                elif (
+                    scan_max_candidate_files > 0
+                    and candidate_file_count is not None
+                    and candidate_file_count > scan_max_candidate_files
+                ):
+                    message = (
+                        "scan skipped: candidate file count "
+                        f"{candidate_file_count} exceeds limit {scan_max_candidate_files}"
+                    )
+                    skipped_record = {
+                        "repo_url": task.url,
+                        "repo_ref": task.ref,
+                        "repo_path": repo_path,
+                        "success": False,
+                        "skipped": True,
+                        "message": message,
+                        "duration_sec": round(clone_duration_sec + candidate_duration_sec, 3),
+                        "finished_at": now_iso(),
+                        "results": {},
+                        "stage": "scan_skipped",
+                        "candidate_file_count": candidate_file_count,
+                        "candidate_total_bytes": candidate_total_bytes,
+                        "clone_duration_sec": clone_duration_sec,
+                        "candidate_duration_sec": candidate_duration_sec,
+                    }
+                    write_json(result_file, skipped_record)
+                    records.append(
+                        {
+                            "repo_url": task.url,
+                            "repo_ref": task.ref,
+                            "repo_path": repo_path,
+                            "success": False,
+                            "skipped": True,
+                            "message": message,
+                            "duration_sec": round(clone_duration_sec + candidate_duration_sec, 3),
+                            "result_file": str(result_file),
+                            "stage": "scan_skipped",
+                            "candidate_file_count": candidate_file_count,
+                            "candidate_total_bytes": candidate_total_bytes,
+                            "clone_duration_sec": clone_duration_sec,
+                            "candidate_duration_sec": candidate_duration_sec,
+                        }
+                    )
+                    append_log_line(
+                        file_limit_skip_log_path,
+                        json.dumps(
+                            {
+                                "batch": batch_name,
+                                "repo_url": task.url,
+                                "repo_ref": task.ref,
+                                "repo_path": repo_path,
+                                "candidate_file_count": candidate_file_count,
+                                "candidate_total_bytes": candidate_total_bytes,
+                                "candidate_duration_sec": candidate_duration_sec,
+                                "scan_max_candidate_files": scan_max_candidate_files,
+                                "scan_max_candidate_bytes": scan_max_candidate_bytes,
+                                "message": message,
+                                "finished_at": now_iso(),
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
+                    if state_cfg["enabled"]:
+                        update_repo_state(
+                            db_path=state_db_path,
+                            repo_url=task.url,
+                            repo_ref=task.ref,
+                            status="scan_skipped",
+                            message=message,
+                            run_id=run_id,
+                            result_file=str(result_file),
+                        )
+                    continue
+                elif (
+                    scan_max_candidate_bytes > 0
+                    and candidate_total_bytes is not None
+                    and candidate_total_bytes > scan_max_candidate_bytes
+                ):
+                    message = (
+                        "scan skipped: candidate total bytes "
+                        f"{candidate_total_bytes} exceeds limit {scan_max_candidate_bytes}"
+                    )
+                    skipped_record = {
+                        "repo_url": task.url,
+                        "repo_ref": task.ref,
+                        "repo_path": repo_path,
+                        "success": False,
+                        "skipped": True,
+                        "message": message,
+                        "duration_sec": round(clone_duration_sec + candidate_duration_sec, 3),
+                        "finished_at": now_iso(),
+                        "results": {},
+                        "stage": "scan_skipped",
+                        "candidate_file_count": candidate_file_count,
+                        "candidate_total_bytes": candidate_total_bytes,
+                        "clone_duration_sec": clone_duration_sec,
+                        "candidate_duration_sec": candidate_duration_sec,
+                    }
+                    write_json(result_file, skipped_record)
+                    records.append(
+                        {
+                            "repo_url": task.url,
+                            "repo_ref": task.ref,
+                            "repo_path": repo_path,
+                            "success": False,
+                            "skipped": True,
+                            "message": message,
+                            "duration_sec": round(clone_duration_sec + candidate_duration_sec, 3),
+                            "result_file": str(result_file),
+                            "stage": "scan_skipped",
+                            "candidate_file_count": candidate_file_count,
+                            "candidate_total_bytes": candidate_total_bytes,
+                            "clone_duration_sec": clone_duration_sec,
+                            "candidate_duration_sec": candidate_duration_sec,
+                        }
+                    )
+                    append_log_line(
+                        file_limit_skip_log_path,
+                        json.dumps(
+                            {
+                                "batch": batch_name,
+                                "repo_url": task.url,
+                                "repo_ref": task.ref,
+                                "repo_path": repo_path,
+                                "candidate_file_count": candidate_file_count,
+                                "candidate_total_bytes": candidate_total_bytes,
+                                "candidate_duration_sec": candidate_duration_sec,
+                                "scan_max_candidate_files": scan_max_candidate_files,
+                                "scan_max_candidate_bytes": scan_max_candidate_bytes,
+                                "message": message,
+                                "finished_at": now_iso(),
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
+                    if state_cfg["enabled"]:
+                        update_repo_state(
+                            db_path=state_db_path,
+                            repo_url=task.url,
+                            repo_ref=task.ref,
+                            status="scan_skipped",
+                            message=message,
+                            run_id=run_id,
+                            result_file=str(result_file),
+                        )
+                    continue
+            to_scan.append((task, repo_path, str(result_file), scan_timeout_sec))
+
+        scan_phase_started = time.time()
+        scan_phase_sec = 0.0
         print(f"[{batch_name}] scanning {len(to_scan)} repos in parallel...")
         if to_scan:
             scan_total = len(to_scan)
@@ -1073,16 +1610,22 @@ def main() -> int:
                     scan_done += 1
                     if scan_done == scan_total or (scan_progress_step > 0 and scan_done % scan_progress_step == 0):
                         print(f"[{batch_name}] scan progress: {scan_done}/{scan_total}")
+            scan_phase_sec = round(time.time() - scan_phase_started, 3)
 
         success_count = sum(1 for r in records if r["success"])
-        fail_count = len(records) - success_count
+        skipped_count = sum(1 for r in records if r.get("skipped"))
+        fail_count = len(records) - success_count - skipped_count
         batch_data = {
             "batch": batch_name,
             "started_at": now_iso(),
             "duration_sec": round(time.time() - batch_started, 3),
             "total": len(records),
             "success": success_count,
+            "skipped": skipped_count,
             "failed": fail_count,
+            "clone_wall_sec": clone_phase_sec,
+            "candidate_wall_sec": candidate_phase_sec,
+            "scan_wall_sec": scan_phase_sec,
             "records": records,
         }
         write_json(batch_manifest, batch_data)
@@ -1104,6 +1647,10 @@ def main() -> int:
 
         if remote_cfg.get("enabled"):
             sync_targets: List[Path] = [manifest_root, result_root]
+            if mirror_skip_log_path.exists():
+                sync_targets.append(mirror_skip_log_path)
+            if file_limit_skip_log_path.exists():
+                sync_targets.append(file_limit_skip_log_path)
             if timeout_log_path.exists():
                 sync_targets.append(timeout_log_path)
             remote_err = rsync_to_remote(remote_cfg, sync_targets)
@@ -1117,18 +1664,20 @@ def main() -> int:
 
         overall["total_success"] += success_count
         overall["total_failed"] += fail_count
+        overall["total_skipped"] += skipped_count
         overall["batches"].append(
             {
                 "batch": batch_name,
                 "total": len(records),
                 "success": success_count,
+                "skipped": skipped_count,
                 "failed": fail_count,
                 "manifest": str(batch_manifest),
                 "upload": upload_status,
             }
         )
         print(
-            f"[{batch_name}] finished: success={success_count} failed={fail_count} "
+            f"[{batch_name}] finished: success={success_count} skipped={skipped_count} failed={fail_count} "
             f"duration={batch_data['duration_sec']}s"
         )
 
@@ -1137,9 +1686,16 @@ def main() -> int:
     overall_path = run_dir / "run_summary.json"
     write_json(overall_path, overall)
     print(f"run summary: {overall_path}")
-    print(f"total success={overall['total_success']} failed={overall['total_failed']}")
+    print(
+        f"total success={overall['total_success']} "
+        f"skipped={overall['total_skipped']} failed={overall['total_failed']}"
+    )
     if remote_cfg.get("enabled"):
         sync_targets: List[Path] = [overall_path, manifest_root, result_root]
+        if mirror_skip_log_path.exists():
+            sync_targets.append(mirror_skip_log_path)
+        if file_limit_skip_log_path.exists():
+            sync_targets.append(file_limit_skip_log_path)
         if timeout_log_path.exists():
             sync_targets.append(timeout_log_path)
         remote_err = rsync_to_remote(remote_cfg, sync_targets)

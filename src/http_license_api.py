@@ -10,6 +10,7 @@ import traceback
 from pymongo import MongoClient
 
 import licensedb
+from light_scan import append_scan_error, run_fast_scan
 from localconfig import local_mongodb_db, local_mongodb_host, local_mongodb_port, local_mongodb_url
 from ltree import LTree
 
@@ -57,6 +58,37 @@ def _run_scancode(path: str):
             results = json.load(fp)
 
         return proc.returncode, results
+
+
+def _scan_backend() -> str:
+    backend = os.getenv("LICENSE_SCAN_BACKEND", "auto").strip().lower()
+    if backend in {"fast", "scancode", "auto"}:
+        return backend
+    return "auto"
+
+
+def _run_scan(path: str):
+    backend = _scan_backend()
+    if backend == "scancode":
+        rc, results = _run_scancode(path)
+        results["scan_backend"] = "scancode"
+        return rc, results
+
+    _rc, fast_results, fast_meta = run_fast_scan(path, ignores_pattern)
+    if backend == "fast" or not fast_meta["needs_fallback"]:
+        return 0, fast_results
+
+    try:
+        rc, results = _run_scancode(path)
+        results["scan_backend"] = "scancode"
+        results["scan_meta"] = {"fallback_from": "fast", "fallback_reasons": fast_meta["fallback_reasons"]}
+        return rc, results
+    except Exception:
+        append_scan_error(
+            fast_results,
+            "fast scan requested scancode fallback but scancode command is unavailable; using fast result only",
+        )
+        return 0, fast_results
 
 
 def _collect_scan_errors(results):
@@ -120,7 +152,7 @@ def license_check(codebase):
             path = os.path.join(codebase, file)
 
     try:
-        _, results = _run_scancode(path)
+        _, results = _run_scan(path)
     except Exception:
         success = False
         message = 'scancode cli error: {}: \nException: {}'.format(codebase, traceback.format_exc())
@@ -145,6 +177,7 @@ def license_check(codebase):
     success = success and detect_success
     if detect_success:
         result = ltree.get_result()
+        result["scan_backend"] = results.get("scan_backend", _scan_backend())
         if scan_errors:
             result["scan_errors"] = scan_errors
             result["scan_error_count"] = len(scan_errors)
