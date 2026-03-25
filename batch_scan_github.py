@@ -1029,6 +1029,7 @@ def main() -> int:
     scan_workers = int(run_cfg.get("scan_workers", os.cpu_count() or 4))
     dataset_partition_total = int(run_cfg.get("dataset_partition_total", 1))
     dataset_partition_index = int(run_cfg.get("dataset_partition_index", 0))
+    partition_tag = f"p{dataset_partition_index:02d}-of-{dataset_partition_total:02d}"
     scan_progress_step = int(run_cfg.get("scan_progress_step", 10))
     scan_timeout_sec = int(run_cfg.get("scan_timeout_sec", 0))
     repo_max_unpacked_bytes = int(
@@ -1077,6 +1078,7 @@ def main() -> int:
         f"skipped_by_partition={task_prep['skipped_by_partition']})"
     )
     print(f"dataset_partition: {dataset_partition_index}/{dataset_partition_total}")
+    print(f"oss_partition_tag: {partition_tag}")
     if state_cfg["enabled"]:
         print(f"state_db: {state_db_path}")
         print(f"batch_size: {batch_size}, clone_workers: {clone_workers}, scan_workers: {scan_workers}")
@@ -1392,7 +1394,7 @@ def main() -> int:
             upload_status = upload_files_to_oss(
                 oss_cfg=oss_cfg,
                 local_files=upload_files,
-                key_prefix=f"{run_id}/{batch_name}",
+                key_prefix=f"{run_id}/{partition_tag}/{batch_name}",
             )
             print(
                 f"[{batch_name}] upload done: uploaded={upload_status['uploaded']} "
