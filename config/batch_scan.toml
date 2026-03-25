@@ -12,6 +12,10 @@ scan_workers = 16
 scan_timeout_sec = 180
 shuffle_seed = 20260321
 shuffle_bucket_count = 256
+# Multi-machine sharding (stable by repo_url + repo_ref hash).
+# For 5 machines: set total=5, and use index=0..4 on each machine.
+dataset_partition_total = 1
+dataset_partition_index = 0
 
 # Temporary working root for this batch pipeline.
 work_dir = "/root/lanyun-tmp/license-check/runtime/local-run"
@@ -93,9 +97,9 @@ token = ""
 host = "127.0.0.1"
 port = 27037
 user = "sca"
-password = ""
+password = "sca123"
 db = "sca"
-url = "mongodb://127.0.0.1:27037/sca"
+url = "mongodb://sca:sca123@127.0.0.1:27037/sca?authSource=sca"
 
 [OSS]
 # Set to true in production.
@@ -113,7 +117,7 @@ access_key_id = ""
 access_key_secret = ""
 
 # Optional: used to build readable object URLs in upload summary.
-public_base_url = "https://your-bucket-name.oss-cn-hangzhou.aliyuncs.com"
+public_base_url = "https://ai-live-review-storage.oss-cn-hangzhou.aliyuncs.com"
 
 # Optional, explicit provider ("aliyun" or "s3"). Auto-detected if omitted.
 provider = "aliyun"

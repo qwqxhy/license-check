@@ -332,6 +332,11 @@ def _shuffle_key(task: RepoTask, seed: int) -> str:
     return hashlib.sha1(raw).hexdigest()
 
 
+def _partition_slot(task: RepoTask) -> int:
+    raw = f"{task.url}\t{task_ref_value(task.ref)}".encode("utf-8")
+    return int(hashlib.sha1(raw).hexdigest()[:8], 16)
+
+
 def prepare_task_buckets(
     repos_file: Path,
     spool_dir: Path,
@@ -339,6 +344,8 @@ def prepare_task_buckets(
     shuffle_bucket_count: int,
     state_db_path: Path,
     state_enabled: bool,
+    dataset_partition_total: int,
+    dataset_partition_index: int,
 ) -> Dict[str, Any]:
     spool_dir.mkdir(parents=True, exist_ok=True)
     bucket_count = max(1, int(shuffle_bucket_count))
@@ -346,11 +353,18 @@ def prepare_task_buckets(
     seen_db_path = spool_dir / "seen_tasks.sqlite3"
     seen_conn = sqlite3.connect(str(seen_db_path))
     state_conn = sqlite3.connect(str(state_db_path)) if state_enabled and state_db_path.exists() else None
+    partition_total = max(1, int(dataset_partition_total))
+    partition_index = int(dataset_partition_index)
+    if partition_index < 0 or partition_index >= partition_total:
+        raise ValueError(
+            f"dataset_partition_index must be in [0, {partition_total - 1}], got {partition_index}"
+        )
     stats = {
         "input_total": 0,
         "accepted_total": 0,
         "duplicate_total": 0,
         "skipped_completed": 0,
+        "skipped_by_partition": 0,
     }
     try:
         seen_conn.execute(
@@ -376,6 +390,9 @@ def prepare_task_buckets(
                     continue
                 if state_conn is not None and is_task_completed(state_conn, task.url, task.ref):
                     stats["skipped_completed"] += 1
+                    continue
+                if partition_total > 1 and (_partition_slot(task) % partition_total) != partition_index:
+                    stats["skipped_by_partition"] += 1
                     continue
                 sort_key = _shuffle_key(task, shuffle_seed)
                 bucket_idx = int(sort_key[:8], 16) % bucket_count
@@ -1010,6 +1027,8 @@ def main() -> int:
     batch_size = int(run_cfg.get("batch_size", 100))
     clone_workers = int(run_cfg.get("clone_workers", 8))
     scan_workers = int(run_cfg.get("scan_workers", os.cpu_count() or 4))
+    dataset_partition_total = int(run_cfg.get("dataset_partition_total", 1))
+    dataset_partition_index = int(run_cfg.get("dataset_partition_index", 0))
     scan_progress_step = int(run_cfg.get("scan_progress_step", 10))
     scan_timeout_sec = int(run_cfg.get("scan_timeout_sec", 0))
     repo_max_unpacked_bytes = int(
@@ -1044,6 +1063,8 @@ def main() -> int:
         shuffle_bucket_count=shuffle_bucket_count,
         state_db_path=state_db_path,
         state_enabled=bool(state_cfg["enabled"]),
+        dataset_partition_total=dataset_partition_total,
+        dataset_partition_index=dataset_partition_index,
     )
 
     print(f"config: {cfg_path}")
@@ -1051,8 +1072,11 @@ def main() -> int:
     print(f"input_tasks: {task_prep['input_total']}")
     print(
         f"total_tasks: {task_prep['accepted_total']} "
-        f"(duplicates={task_prep['duplicate_total']} skipped_completed={task_prep['skipped_completed']})"
+        f"(duplicates={task_prep['duplicate_total']} "
+        f"skipped_completed={task_prep['skipped_completed']} "
+        f"skipped_by_partition={task_prep['skipped_by_partition']})"
     )
+    print(f"dataset_partition: {dataset_partition_index}/{dataset_partition_total}")
     if state_cfg["enabled"]:
         print(f"state_db: {state_db_path}")
         print(f"batch_size: {batch_size}, clone_workers: {clone_workers}, scan_workers: {scan_workers}")
@@ -1099,6 +1123,9 @@ def main() -> int:
         "input_tasks": int(task_prep["input_total"]),
         "duplicate_tasks": int(task_prep["duplicate_total"]),
         "skipped_completed": int(task_prep["skipped_completed"]),
+        "skipped_by_partition": int(task_prep["skipped_by_partition"]),
+        "dataset_partition_total": int(dataset_partition_total),
+        "dataset_partition_index": int(dataset_partition_index),
         "total_success": 0,
         "total_failed": 0,
         "total_skipped": 0,

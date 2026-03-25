@@ -9,6 +9,13 @@ repos_file = "config/repos.top1w.txt"
 batch_size = 100
 clone_workers = 8
 scan_workers = 16
+shuffle_seed = 20260321
+shuffle_bucket_count = 256
+
+# Multi-machine sharding (stable by repo_url + repo_ref hash).
+# For 5 machines: set total=5, and use index=0..4 on each machine.
+dataset_partition_total = 1
+dataset_partition_index = 0
 
 # Temporary working root for this batch pipeline.
 work_dir = "/tmp/license-batch-run"
